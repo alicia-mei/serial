@@ -1,6 +1,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/gpio.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -10,6 +11,22 @@
 #define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
 
 #define MSG_SIZE 8 //tamanho da mensagem em bytes
+
+#define SW0_NODE    DT_ALIAS(sw0)
+#if !DT_NODE_HAS_STATUS_OKAY(SW0_NODE)
+#error "Unsupported board: sw0 devicetree alias is not defined"
+#endif
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios,
+                                  {0});
+static struct gpio_callback button_cb_data;
+
+const struct device *stx = DEVICE_DT_GET(DT_NODELABEL(gpiob));
+
+/* no int main colocar
+    gpio_pin_configure(stx, 0x3, GPIO_OUTPUT_ACTIVE);
+    gpio_pin_set(stx,0x3,valor para setar o pino);
+
+*/
 
 K_FIFO_DEFINE(my_fifo);
 K_MUTEX_DEFINE(my_mutex);
@@ -28,7 +45,7 @@ struct data_item_t {
     uint32_t value;        /* valor armazenado */
 };
 
-int a = 0x0, cnt = 0; 
+int a = 0x0, cnt = 0, *rx_msg = 0, *tx_msg = 0; 
 
 /* Contador de itens da fifo, max 11 */
 int qty_fifo = 0;
@@ -121,9 +138,26 @@ void get_message_thread(int unused1, int unused2, int unused3)
 
 /*................................................................................................................................................................... */
 
-void le(){
-    a = a << 1; 
-    a = a | rx.read(); //armazena o caracter recebido na variavel a
+void rx(){
+    const struct device *dev;
+    int ret;
+
+    if (!gpio_is_ready_dt(&button)) {
+        printk("Error: button device %s is not ready\n",
+               button.port->name);
+        return 0;
+    }
+
+    ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+    if (ret != 0) {
+        printk("Error %d: failed to configure %s pin %d\n",
+               ret, button.port->name, button.pin);
+        return 0;
+    }
+
+    gpio_port_get(&button, &rx_msg);
+    a = a | rx_msg; //armazena o caracter recebido na variavel a
+
     /*cnt = 3 significa que o dispositivo deve ter recebido o mesmo numero 4 vezes*/
     if(cnt == 3){
         if(((a & 0b1111) == 0b1111) || ((a & 0b1111) == 0b0111) || ((a & 0b1111) == 0b1110) || ((a & 0b1111) == 0b0110)){ //mascaras para verificar se os dois bits centrais são iguais a 1
@@ -141,21 +175,13 @@ void le(){
     }
 }
 
-void escreve(char palavra, int bits){
+void tx(char palavra){
     char bufft = palavra;
-    for(int i = 0; i<bits; i++){
+    for(int i = 0; i < 8; i++){
         if ((bufft & 0b10000000) == 0b10000000) tx.write(1); 
         else tx.write(0);
         wait_us(100);
         bufft = bufft << 1;
-        wait_us(200);
-        le();
-        wait_us(200);
-        le();
-        wait_us(200);
-        le();
-        wait_us(200);
-        le();
     }
 }
 
@@ -250,6 +276,9 @@ void consumer_thread_2(int unused1, int unused2, int unused3)
 }
 
 /* incompleto */
+
+K_TIMER_DEFINE(rx_timer, rx, NULL);
+k_timer_start(&rx_timer, K_MSEC(200), K_MSEC(200)); //timer para chamar a função rx a cada 200ms
 
 /* Definir as threads */
 /* Obs.: para obter as diferentes combinações, basta comentar o define das threads que não deseja utilizar*/
