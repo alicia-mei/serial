@@ -8,138 +8,132 @@
 
 #define STACKSIZE 1024
 
-#define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
-
-#define MSG_SIZE 8 //tamanho da mensagem em bytes
-
-#define SW0_NODE    DT_ALIAS(sw0)
-#if !DT_NODE_HAS_STATUS_OKAY(SW0_NODE)
-#error "Unsupported board: sw0 devicetree alias is not defined"
-#endif
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios,
-                                  {0});
-static struct gpio_callback button_cb_data;
-
-const struct device *stx = DEVICE_DT_GET(DT_NODELABEL(gpiob));
-
-/* no int main colocar
-    gpio_pin_configure(stx, 0x3, GPIO_OUTPUT_ACTIVE);
-    gpio_pin_set(stx,0x3,valor para setar o pino);
-
-*/
-
 K_FIFO_DEFINE(my_fifo);
 K_MUTEX_DEFINE(my_mutex);
-
-/* queue to store up to 10 messages (aligned to 4-byte boundary) */
-K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 10, 4);
-
-static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE);
-
-/* receive buffer used in UART ISR callback */
-static char rx_buf[MSG_SIZE];
-static int rx_buf_pos;
 
 struct data_item_t {
     void *fifo_reserved;   /* primeira palavra reservada para uso pela FIFO (do site do zephyr)*/
     uint32_t value;        /* valor armazenado */
 };
 
-int a = 0x0, cnt = 0, *rx_msg = 0, *tx_msg = 0; 
-
 /* Contador de itens da fifo, max 11 */
-int qty_fifo = 0;
+int qty_fifo_header_data = 0;
 
-/*
- * Read characters from UART until line end is detected. Afterwards push the
- * data to the message queue.
- */
+/*Recepcao da mensagem do usuario.......................................................................................................................................*/
+#define UART_DEVICE_NODE DT_CHOSEN(zephyr_shell_uart)
+#define MSG_SIZE 8 //tamanho da mensagem em bytes
 
-/*....................................................................................................................................................................*/
+K_MSGQ_DEFINE(uart_msgq, MSG_SIZE, 10, 4); //fila para armazenar 10 mensagens de tamanho 8 bits, sendo o ultimo bit /0
+
+static const struct device *const uart_dev = DEVICE_DT_GET(UART_DEVICE_NODE); //ponteiro para o dispositivo uart obtido através do nó do device tree
+
+// utilizados na funcao callback serial
+static char rx_buf[MSG_SIZE]; //uma string de tamanho 8 bits
+static int rx_buf_pos; //variavel usada como buffer da funcao
+
+uint8_t id_mask = 0b00101000;
+
+K_FIFO_DEFINE(header_data); //cria fifo pra armazenar o cabecalho + dados
+
 void serial_cb(const struct device *dev, void *user_data)
 {
-	uint8_t c;
+    uint8_t c;
 
-	if (!uart_irq_update(uart_dev)) {
-		return;
-	}
+    if (!uart_irq_update(uart_dev)) {
+        return;
+    }
 
-	if (!uart_irq_rx_ready(uart_dev)) {
-		return;
-	}
+    if (!uart_irq_rx_ready(uart_dev)) {
+        return;
+    }
 
-	/* read until FIFO empty */
-	while (uart_fifo_read(uart_dev, &c, 1) == 1) {
-		if ((c == '\n' || c == '\r') && rx_buf_pos > 0) {
-			/* terminate string */
-			rx_buf[rx_buf_pos] = '\0';
+    /* le ate a fifo ficar vazia */
+    while (uart_fifo_read(uart_dev, &c, 1) == 1) {
+        if ((c == '\n' || c == '\r') && rx_buf_pos > 0) { //se o caracter lido for \n ou \r
+            rx_buf[rx_buf_pos] = '\0'; //termina a string
 
-			/* if queue is full, message is silently dropped */
-			k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT);
+            k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT); //coloca a mensagem na fila de mensagens
 
-			/* reset the buffer (it was copied to the msgq) */
-			rx_buf_pos = 0;
-		} else if (rx_buf_pos < (sizeof(rx_buf) - 1)) {
-			rx_buf[rx_buf_pos++] = c;
-		}
-		/* else: characters beyond buffer size are dropped */
-	}
+            rx_buf_pos = 0; //reseta o buffer para 0
+        } else {
+            rx_buf[rx_buf_pos++] = c; //addiciona o caracter lido na string de buffer na posição rx_buf_pos e depois soma 1 a rx_buf_pos
+
+            if (rx_buf_pos >= MSG_SIZE - 1) { //se ja foram lidos 7 chars
+                rx_buf[rx_buf_pos] = '\0';  //termina a string
+                k_msgq_put(&uart_msgq, &rx_buf, K_NO_WAIT); // coloca na fila de mensagens
+                rx_buf_pos = 0;  // reseta o buffer para poder continuar recebendo a mensagem
+            }
+        }
+    }
 }
 
-/*
- * Print a null-terminated string character by character to the UART interface
- */
 void print_uart(char *buf)
 {
-	int msg_len = strlen(buf);
+    int msg_len = strlen(buf); //tamanho da mensagem
 
-	for (int i = 0; i < msg_len; i++) {
-		uart_poll_out(uart_dev, buf[i]);
-	}
+    for (int i = 0; i < msg_len; i++) {
+        uart_poll_out(uart_dev, buf[i]); //printa a mensagem
+    }
 }
 
-void get_message_thread(int unused1, int unused2, int unused3)
+void get_message()
 {
-    char tx_buf[MSG_SIZE];
+    char tx_buf[MSG_SIZE]; //string de 8 bytes
 
-	if (!device_is_ready(uart_dev)) {
-		printk("UART device not found!");
-		return 0;
-	}
+    if (!device_is_ready(uart_dev)) {
+        printk("UART device not found!\n");
+        return 0;
+    }
 
-	/* configure interrupt and callback to receive data */
-	int ret = uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
+    /* configura interrupt e callback para receber dados*/
+    int ret = uart_irq_callback_user_data_set(uart_dev, serial_cb, NULL);
 
-	if (ret < 0) {
-		if (ret == -ENOTSUP) {
-			printk("Interrupt-driven UART API support not enabled\n");
-		} else if (ret == -ENOSYS) {
-			printk("UART device does not support interrupt-driven API\n");
-		} else {
-			printk("Error setting UART callback: %d\n", ret);
-		}
-		return 0;
-	}
-	uart_irq_rx_enable(uart_dev);
-
-	print_uart("Digite a mensagem que deseja enviar e depois clique enter: \r\n");
-
-	/* indefinitely wait for input from the user */
-	while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {
-		print_uart("voce digitou: ");
-		print_uart(tx_buf);
-		print_uart("\r\n");
-        for(int i = 0; i < strlen(tx_buf); i++){
-
+    if (ret < 0) { //erros
+        if (ret == -ENOTSUP) {
+            printk("Interrupt-driven UART API support not enabled\n");
+        } else if (ret == -ENOSYS) {
+            printk("UART device does not support interrupt-driven API\n");
+        } else {
+            printk("Error setting UART callback: %d\n", ret);
         }
-	}
-	return 0;
+        return 0;
+    }
+    uart_irq_rx_enable(uart_dev); //ativa a uart
+    
+    print_uart("Digite a mensagem que deseja enviar e aperte enter ao terminar\r\n");
+
+    /* espera receber mensagem do usuário para sempre */
+    while (k_msgq_get(&uart_msgq, &tx_buf, K_FOREVER) == 0) {
+        if(qty_fifo_header_data > 20){
+            uint8_t bits = strlen(tx_buf);  // Número de mensagens a ser convertido em bits para colocar no id 
+            uint8_t header = id_mask | bits; //define o cabeçalho (id + qtd de bytes)
+            k_fifo_put(&header_data, &header); //coloca o cabecalho na fifo
+            k_fifo_put(&header_data, &tx_buf); //coloca a mensagem na fifo
+        }
+        else{
+            print_uart("existem muitas mensagens na fila de transmissão, tente novamente mais tarde.\r\n");
+        }
+    }
 }
 
-/*................................................................................................................................................................... */
+/*Recepcao da transmissao................................................................................................................................................. */
+#define SW0_NODE    DT_ALIAS(sw0) //vamos utilizar o mesmo pino do botao como gpio de input
+#if !DT_NODE_HAS_STATUS_OKAY(SW0_NODE)
+#error "Unsupported board: sw0 devicetree alias is not defined"
+#endif
+
+static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios,
+                                  {0});
+static struct gpio_callback button_cb_data;
+
+int a = 0x0, cnt = 0, *rx_msg = 0, *tx_msg = 0, shift = 0, n_data, aux = 0; 
+char sync = 0b00010110, etx = 0b00000011, stx = 0b00000010, cabecalho = 0b0, caracter = 0b0;
+char cabecalho_buf = 0b00101000; 
+
+K_MUTEX_DEFINE(tx_mutex);
+K_FIFO_DEFINE(recebidos); //cria fifo pra armazenar o cabecalho + dados
 
 void rx(){
-    const struct device *dev;
     int ret;
 
     if (!gpio_is_ready_dt(&button)) {
@@ -154,28 +148,103 @@ void rx(){
                ret, button.port->name, button.pin);
         return 0;
     }
+    while(1){
+        rx_msg = gpio_pin_get_dt(&button); //le o valor recebido no pino que esta o rx
 
-    gpio_port_get(&button, &rx_msg);
-    a = a | rx_msg; //armazena o caracter recebido na variavel a
+        a = a << 1; //shifta a 1 para a esquerda
+        a = a | rx_msg; //armazena o caracter recebido na variavel a
 
-    /*cnt = 3 significa que o dispositivo deve ter recebido o mesmo numero 4 vezes*/
-    if(cnt == 3){
-        if(((a & 0b1111) == 0b1111) || ((a & 0b1111) == 0b0111) || ((a & 0b1111) == 0b1110) || ((a & 0b1111) == 0b0110)){ //mascaras para verificar se os dois bits centrais são iguais a 1
-            caracter = caracter << 1; //shifta uma posicao para a esquerda para poder armazenar um valor no ultimo bit
-            caracter = caracter | 0b1; //armazena 1 no ultimo bit
-            cnt = 0; //zera o contador
+        /*cnt = 3 significa que o dispositivo deve ter recebido o mesmo numero 4 vezes*/
+        if(cnt == 3){
+            if(((a & 0b1111) == 0b1111) || ((a & 0b1111) == 0b0111) || ((a & 0b1111) == 0b1110) || ((a & 0b1111) == 0b0110)){ //mascaras para verificar se os dois bits centrais são iguais a 1
+                caracter = caracter << 1; //shifta uma posicao para a esquerda para poder armazenar um valor no ultimo bit
+                caracter = caracter | 0b1; //armazena 1 no ultimo bit
+                cnt = 0; //zera o contador
+                if(state > 1) shift++; //contador para saber quantos bits foram armazenados em caracter
+            }
+            else if(((a & 0b1111) == 0b0) || ((a & 0b1111) == 0b0001) || ((a & 0b1111) == 0b1000) || ((a & 0b1111) == 0b1001)){ //mascaras para verificar se os dois bits centrais são iguais a 0
+                caracter = caracter << 1;  //shifta uma posicao, 0 fica no ultimo bit
+                cnt = 0;
+                if(state > 1) shift++;
+            }
         }
-        else if(((a & 0b1111) == 0b0) || ((a & 0b1111) == 0b0001) || ((a & 0b1111) == 0b1000) || ((a & 0b1111) == 0b1001)){ //mascaras para verificar se os dois bits centrais são iguais a 0
-            caracter = caracter << 1;  //shifta uma posicao, 0 fica no ultimo bit
-            cnt = 0;
+        else {
+            cnt++;
         }
-    }
-    else {
-        cnt++;
+        /*máquina de estados para checar qual informação está recebendo*/
+        if(state == 0){ //estado 0: pre
+            if(caracter == pre){
+                printk("pre");
+                state = 1; //se estiver correto, muda estado para conferir o sync
+                shift = 0; //inicia contagem de quantos bits foram armazenados para comparar o caracter criado com o esperado
+            }
+        }
+        else if(shift = 8){
+            if(state == 1){ //estado 1: sync
+                if(caracter == sync){
+                    printk("sync");
+                    state = 2; //se estiver correto, muda estado para conferir o stx
+                }
+                else state = 0; //se o dado estiver incorreto, reinicia a maquina de estados, volta a procurar o pre
+            }
+            else if(state == 2){ //estado 2: stx
+                if(caracter == stx){
+                    printk("stx");
+                    state = 3; //se estiver correto, muda estado para conferir o cabecalho
+                }
+                else state = 0;
+            }
+            else if(state == 3){ //estado 3: cabecalho
+                if(caracter == cabecalho_buf){ //compara com o cabecalho armazendo no buf da thread de transmissao
+                    printk("nosso cabecalho");
+                    /*transforma os últimos 3 bits no número de bytes que serão transmitidos*/
+                    if((caracter & 0b00000100) == 0b00000100) {
+                        n_data = n_data + 4;
+                    }
+                    if((caracter & 0b00000010) == 0b00000010) {
+                        n_data = n_data + 2;
+                    }
+                    if((caracter & 0b00000001) == 0b00000001) {
+                        n_data = n_data + 1;
+                    }
+                    state = 4; //muda o estado para checar os dados
+                }
+                else{
+                    state = 0; //se não for nosso id
+                    if(k_mutex_lock(&tx_mutex, K_FOREVER) == 0); //trava o mutex da transmissao, nosso para de transmitir
+                }
+            }
+            else if(state == 4){ //estado 4: leitura de dados
+                if(aux < n_data){ //garante que todos os bytes serão lidos
+                    if(caracter == data_buf[aux]){ //compara com o cada caracter do dado armazenado no buf da thread de transmissao
+                        k_fifo_put(&recebidos, &caracter); //coloca o caracter na fifo de recebidos
+                        aux++; //incremente o contador auxiliar
+                    }
+                    else state = 0;
+                }
+                else state 
+            }
+            else if(state == 5){//estado 5: etx
+                if(caracter == ){
+                    printk("etx");
+                }
+                state = 0;
+                //signal para a thread de mudança poder atualizar a fifo tx
+            }
+        }
     }
 }
 
-void tx(char palavra){
+
+/*Transmissao................................................................................................................................................. */
+
+const struct device *gpio_rx = DEVICE_DT_GET(DT_NODELABEL(gpiob));
+
+void tx(){
+    gpio_pin_configure(gpio_rx, 0x3, GPIO_OUTPUT_ACTIVE);
+    gpio_pin_set(gpio_rx ,0x3, valor para setar o pino);
+
+
     char bufft = palavra;
     for(int i = 0; i < 8; i++){
         if ((bufft & 0b10000000) == 0b10000000) tx.write(1); 
