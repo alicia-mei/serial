@@ -128,10 +128,13 @@ static struct gpio_callback button_cb_data;
 
 int a = 0x0, cnt = 0, *rx_msg = 0, *tx_msg = 0, shift = 0, n_data, aux = 0; 
 char sync = 0b00010110, etx = 0b00000011, stx = 0b00000010, cabecalho = 0b0, caracter = 0b0;
-char cabecalho_buf = 0b00101000; 
+uint8_t cabecalho_buf = 0b00101000; 
 
-K_MUTEX_DEFINE(tx_mutex);
+K_MUTEX_DEFINE(tx_mutex); //cria mutex para travar a nossa transmissão
+K_MUTEX_DEFINE(msg_mutex); //cria mutex para travar a leitura e escrita da mensagem no data_buf e cabecalho_buf
+K_MUTEX_DEFINE(next_mutex); //cria mutex para travar a mudanca de mensagem
 K_FIFO_DEFINE(recebidos); //cria fifo pra armazenar o cabecalho + dados
+K_CONDVAR_DEFINE(change_msg);
 
 void rx(){
     int ret;
@@ -197,60 +200,103 @@ void rx(){
             else if(state == 3){ //estado 3: cabecalho
                 if(caracter == cabecalho_buf){ //compara com o cabecalho armazendo no buf da thread de transmissao
                     printk("nosso cabecalho");
-                    /*transforma os últimos 3 bits no número de bytes que serão transmitidos*/
-                    if((caracter & 0b00000100) == 0b00000100) {
-                        n_data = n_data + 4;
-                    }
-                    if((caracter & 0b00000010) == 0b00000010) {
-                        n_data = n_data + 2;
-                    }
-                    if((caracter & 0b00000001) == 0b00000001) {
-                        n_data = n_data + 1;
-                    }
-                    state = 4; //muda o estado para checar os dados
+                    nosso = 1;
                 }
-                else{
-                    state = 0; //se não for nosso id
+                else{ //se não for nosso id
+                    nosso = 0;
                     if(k_mutex_lock(&tx_mutex, K_FOREVER) == 0); //trava o mutex da transmissao, nosso para de transmitir
                 }
+                /*transforma os últimos 3 bits no número de bytes que serão transmitidos*/
+                if((caracter & 0b00000100) == 0b00000100) {
+                    n_data = n_data + 4;
+                }
+                if((caracter & 0b00000010) == 0b00000010) {
+                    n_data = n_data + 2;
+                }
+                if((caracter & 0b00000001) == 0b00000001) {
+                    n_data = n_data + 1;
+                }
+                state = 4; //muda o estado para checar os dados
             }
             else if(state == 4){ //estado 4: leitura de dados
+                k_mutex_lock(&next_mutex); 
                 if(aux < n_data){ //garante que todos os bytes serão lidos
-                    if(caracter == data_buf[aux]){ //compara com o cada caracter do dado armazenado no buf da thread de transmissao
-                        k_fifo_put(&recebidos, &caracter); //coloca o caracter na fifo de recebidos
-                        aux++; //incremente o contador auxiliar
+                    if(nosso){
+                        if(caracter == data_buf[aux]){ //compara com o cada caracter do dado armazenado no buf da thread de transmissao
+                            k_fifo_put(&recebidos, &caracter); //coloca o caracter na fifo de recebidos
+                        }
+                        else state = 0;
                     }
-                    else state = 0;
+                    else{
+                        printk("outra transmissão ocorrendo no momento");
+                    }
+                    aux++; //incremente o contador auxiliar
                 }
-                else state 
+                else state = 5;
             }
             else if(state == 5){//estado 5: etx
-                if(caracter == ){
+                if(caracter == etx){
                     printk("etx");
-                }
-                state = 0;
-                //signal para a thread de mudança poder atualizar a fifo tx
+                } 
+                if (nosso == 1){
+                    k_condvar_signal(&change_msg); //sinal para permmitir que a proxima mensagem seja enviada, visto que a última estava inteiramente correta
+                    k_mutex_unlock(&next_mutex); 
+                } 
+                else k_mutex_unlock(&tx_mutex); //significa que a transmissão do outro acabou, nosso pode tentar transmitir
+
+                state = 0; // o rx pode voltar a tentar encontrar o pre
             }
         }
     }
 }
 
-
 /*Transmissao................................................................................................................................................. */
 
 const struct device *gpio_rx = DEVICE_DT_GET(DT_NODELABEL(gpiob));
 
-void tx(){
-    gpio_pin_configure(gpio_rx, 0x3, GPIO_OUTPUT_ACTIVE);
-    gpio_pin_set(gpio_rx ,0x3, valor para setar o pino);
+K_FIFO_DEFINE(to_be); //cria fifo pra armazenar a próxima mensagem a ser transmitida
 
-
-    char bufft = palavra;
+void write_int(int bufft){
     for(int i = 0; i < 8; i++){
-        if ((bufft & 0b10000000) == 0b10000000) tx.write(1); 
-        else tx.write(0);
+        if ((bufft & 0b10000000) == 0b10000000) gpio_pin_set(gpio_rx ,0x3, 1);
+        else gpio_pin_set(gpio_rx ,0x3, 0);
         wait_us(100);
         bufft = bufft << 1;
+    }
+}
+
+void write_char(char bufft){
+    for(int i = 0; i < 8; i++){
+        if ((bufft & 0b10000000) == 0b10000000) gpio_pin_set(gpio_rx ,0x3, 1);
+        else gpio_pin_set(gpio_rx ,0x3, 0);
+        wait_us(100);
+        bufft = bufft << 1;
+    }
+}
+
+void tx(){
+    gpio_pin_configure(gpio_rx, 0x3, GPIO_OUTPUT_ACTIVE);
+    while(1){
+        if(k_fifo_is_empty(&to_be) == 0){
+            cabecalho_buf = k_fifo_get(&to_be, K_FOREVER);
+            data_buf = k_fifo_get(&to_be, K_FOREVER);
+            write_
+            write_int(cabecalho_buf); 
+            write_char(data_buf);  
+        }
+    }
+}
+
+
+void next_message(){
+    while(1){
+        k_mutex_lock(&next_mutex, K_FOREVER);
+        int h = k_fifo_get(&header_data, K_FOREVER); //pega cabecalho da fifo 
+        k_fifo_put(&to_be, &h); //coloca o header na fifo p enviar
+        char d = k_fifo_get(&header_data, K_FOREVER); //pega dado da fifo 
+        k_fifo_put(&to_be, &d); //coloca o dado na fifo p enviar
+        k_condvar_wait(&change_msg, &next_message, K_FOREVER);
+        k_mutex_unlock(&next_mutex);
     }
 }
 
@@ -279,29 +325,6 @@ void producer_thread_1(int unused1, int unused2, int unused3)
     }
 }
 
-/* escritor 2 - mesma lógica do escritor 1*/
-void producer_thread_2(int unused1, int unused2, int unused3)
-{
-    while (1) {
-        if (qty_fifo < 11) {
-            if (k_mutex_lock(&my_mutex, K_MSEC(100)) == 0) {
-                struct data_item_t *tx_data = k_malloc(sizeof(struct data_item_t));
-
-                tx_data->value = 8; 
-
-                k_fifo_put(&my_fifo, tx_data);
-                qty_fifo++;
-                printk("Produtor 2 colocou %d na FIFO (qty_fifo = %d)\n", tx_data->value, qty_fifo);
-
-                k_mutex_unlock(&my_mutex);
-				k_msleep(1000);
-            }
-        } else {
-            k_msleep(100);
-        }
-    }
-}
-
 /* leitor 1*/
 void consumer_thread_1(int unused1, int unused2, int unused3)
 {
@@ -323,27 +346,6 @@ void consumer_thread_1(int unused1, int unused2, int unused3)
     }
 }
 
-/*leitor 2 - usa a mesma lógica do leitor 2*/
-void consumer_thread_2(int unused1, int unused2, int unused3)
-{
-    printk("Consumidor 2 iniciado\n");
-    while (1) {
-        struct data_item_t *rx_data = k_fifo_get(&my_fifo, K_FOREVER);
-
-        if (rx_data) {
-            printk("Consumidor 2 tirou %d da FIFO\n", rx_data->value);
-
-            if (k_mutex_lock(&my_mutex, K_MSEC(100)) == 0) {
-                qty_fifo--;
-                k_mutex_unlock(&my_mutex);
-				k_msleep(1000);
-            }
-
-           k_free(rx_data);
-        }
-    }
-}
-
 /* incompleto */
 
 K_TIMER_DEFINE(rx_timer, rx, NULL);
@@ -353,6 +355,4 @@ k_timer_start(&rx_timer, K_MSEC(200), K_MSEC(200)); //timer para chamar a funç�
 /* Obs.: para obter as diferentes combinações, basta comentar o define das threads que não deseja utilizar*/
 K_THREAD_DEFINE(get_message_id, STACKSIZE, get_message_thread, NULL, NULL, NULL, 7, 0, 0);
 K_THREAD_DEFINE(producer_1_id, STACKSIZE, producer_thread_1, NULL, NULL, NULL, 7, 0, 0);
-K_THREAD_DEFINE(producer_2_id, STACKSIZE, producer_thread_2, NULL, NULL, NULL, 7, 0, 0);
 K_THREAD_DEFINE(consumer_1_id, STACKSIZE, consumer_thread_1, NULL, NULL, NULL, 7, 0, 0);
-K_THREAD_DEFINE(consumer_2_id, STACKSIZE, consumer_thread_2, NULL, NULL, NULL, 7, 0, 0);
